@@ -3,11 +3,54 @@ const cors = require("cors");
 const path = require("path");
 
 const app = express();
-const PORT = process.env.PORT || 3005;
+const PORT = process.env.PORT || 2700;
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
+
+// ─── Proxy Download Endpoint ─────────────────────────────────────────────────
+// Fix: Browser needs a proxy to force download with correct Content-Disposition
+// Direct links to tikwm/savetube often return audio-only or open in browser
+app.get("/api/proxy-download", async (req, res) => {
+  const { url, filename } = req.query;
+  if (!url) return res.status(400).json({ error: "URL required" });
+
+  try {
+    const response = await fetch(decodeURIComponent(url), {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+        Referer: "https://www.tiktok.com/",
+        Accept: "*/*",
+      },
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({ error: "Upstream fetch failed" });
+    }
+
+    const contentType = response.headers.get("content-type") || "video/mp4";
+    const contentLength = response.headers.get("content-length");
+
+    const safeFilename = (filename || "video.mp4").replace(/[^a-zA-Z0-9._-]/g, "_");
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${safeFilename}"`);
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+
+    response.body.pipeTo(
+      new WritableStream({
+        write(chunk) { res.write(chunk); },
+        close() { res.end(); },
+        abort(err) { res.destroy(err); },
+      })
+    );
+  } catch (err) {
+    console.error("[Proxy Error]", err.message);
+    res.status(500).json({ error: "Proxy download failed" });
+  }
+});
 
 // ─── TikTok Endpoint ────────────────────────────────────────────────────────
 app.get("/api/tiktok", async (req, res) => {
@@ -17,15 +60,13 @@ app.get("/api/tiktok", async (req, res) => {
     return res.status(400).json({ success: false, error: "URL is required" });
   }
 
-  const tiktokRegex =
-    /https?:\/\/(www\.|vm\.|vt\.)?tiktok\.com\/.+/i;
+  const tiktokRegex = /https?:\/\/(www\.|vm\.|vt\.)?tiktok\.com\/.+/i;
   if (!tiktokRegex.test(url)) {
-    return res
-      .status(400)
-      .json({ success: false, error: "Invalid TikTok URL" });
+    return res.status(400).json({ success: false, error: "Invalid TikTok URL" });
   }
 
   try {
+    // Request HD explicitly with hd=1
     const apiUrl = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`;
     const response = await fetch(apiUrl, {
       headers: {
@@ -49,6 +90,14 @@ app.get("/api/tiktok", async (req, res) => {
 
     const video = data.data;
 
+    // Fix: hdplay is the true HD video URL (no watermark, high res)
+    // play is SD no-watermark, wmplay is with watermark, music is audio-only
+    // Some videos don't have hdplay — fall back to play (not music!)
+    const hdUrl = video.hdplay && video.hdplay !== video.music ? video.hdplay : null;
+    const sdUrl = video.play && video.play !== video.music ? video.play : null;
+    const wmUrl = video.wmplay && video.wmplay !== video.music ? video.wmplay : null;
+    const audioUrl = video.music || null;
+
     return res.json({
       success: true,
       platform: "tiktok",
@@ -69,10 +118,10 @@ app.get("/api/tiktok", async (req, res) => {
           shares: video.share_count,
         },
         downloads: {
-          no_watermark: video.play,
-          no_watermark_hd: video.hdplay || video.play,
-          watermark: video.wmplay,
-          audio: video.music,
+          no_watermark_hd: hdUrl,
+          no_watermark: sdUrl,
+          watermark: wmUrl,
+          audio: audioUrl,
         },
       },
     });
@@ -96,9 +145,7 @@ app.get("/api/youtube", async (req, res) => {
   const youtubeRegex =
     /https?:\/\/(www\.)?(youtube\.com\/(watch\?v=|shorts\/)|youtu\.be\/).+/i;
   if (!youtubeRegex.test(url)) {
-    return res
-      .status(400)
-      .json({ success: false, error: "Invalid YouTube URL" });
+    return res.status(400).json({ success: false, error: "Invalid YouTube URL" });
   }
 
   try {
@@ -182,7 +229,9 @@ app.get("/api/youtube", async (req, res) => {
       data: {
         id: info.videoId || info.id,
         title: info.title || "YouTube Video",
-        thumbnail: info.thumbnail || `https://img.youtube.com/vi/${info.videoId || info.id}/maxresdefault.jpg`,
+        thumbnail:
+          info.thumbnail ||
+          `https://img.youtube.com/vi/${info.videoId || info.id}/maxresdefault.jpg`,
         duration: info.duration,
         channel: info.channel || info.author || "Unknown",
         downloads: downloadLinks,
@@ -209,5 +258,5 @@ app.use((req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🚀 Video Downloader running at http://localhost:${PORT}\n`);
+  console.log(`\n🚀 VidSave running at http://localhost:${PORT}\n`);
 });
